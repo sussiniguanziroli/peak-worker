@@ -18,6 +18,14 @@ const LOOKBACK_MS = Number(process.env.LOOKBACK_MIN || 135) * 60 * 1000;
 const MAX_GAP_S   = Number(process.env.MAX_GAP_S || 120);
 const ONCE        = process.argv.includes('--once');
 
+// realtime_telemetry tenía vencimiento de 7 días hasta el 2026-10-13: la
+// partición más vieja que sobrevivió es la del 2026-10-05 (UTC). Para lo
+// anterior a esa fecha el pico se completa con raw_telemetry (1 muestra cada
+// 5 min): mismo cálculo, con un hueco tolerado acorde a esa frecuencia. Desde
+// noviembre de 2026 ningún mes recalculado empieza antes, y esto no corre.
+const REALTIME_COMPLETE_FROM = new Date('2026-10-05T00:00:00Z');
+const RAW_MAX_GAP_S = 420;
+
 admin.initializeApp({ projectId: PROJECT_ID });
 const db = admin.firestore();
 
@@ -82,7 +90,7 @@ async function assertCurrent(src, st) {
     dataKey: src.dataKey,
     bucket: st.bucket,
     ts: Date.now(),
-    method: 'sustained-min-15m',
+    method: st.source === 'raw' ? 'sustained-min-15m-raw5m' : 'sustained-min-15m',
     source: 'peak-worker',
   };
   const tag = `${src.tenantId}/${src.locationId}/${src.machineId}`;
@@ -144,17 +152,25 @@ async function processSource(src, now) {
   }
 
   const full = !st;
-  const from = full ? monthStart : new Date(Math.max(monthStart.getTime(), now.getTime() - LOOKBACK_MS));
-  const found = await sustainedPeak({ ...query, from, windowTo: nextStart });
-  const best = better(st && st.value != null ? st : null, found);
+  let from = full ? monthStart : new Date(Math.max(monthStart.getTime(), now.getTime() - LOOKBACK_MS));
+  let fromRaw = null;
+  if (from < REALTIME_COMPLETE_FROM) {
+    fromRaw = await sustainedPeak({
+      ...query, source: 'raw', maxGapS: RAW_MAX_GAP_S,
+      from, windowTo: new Date(Math.min(REALTIME_COMPLETE_FROM.getTime(), nextStart.getTime())),
+    });
+    from = REALTIME_COMPLETE_FROM;
+  }
+  const found = from < now ? await sustainedPeak({ ...query, from, windowTo: nextStart }) : null;
+  const best = better(better(st && st.value != null ? st : null, fromRaw), found);
 
   st = {
     month, dataKey: src.dataKey, topic: src.topic, widgetId: src.widgetId, unit: src.unit, lastRunAt: now,
-    value: best ? best.value : null, bucket: best ? best.bucket : null,
+    value: best ? best.value : null, bucket: best ? best.bucket : null, source: best ? best.source : null,
   };
   state.set(key, st);
 
-  if (full) console.log(`📊 [${key}] ${month} recalculado (${src.origin}, ${src.dataKey}): ${best ? `${fmt(best.value)} ${src.unit} @ ${best.bucket}` : 'sin ventana sostenida'}`);
+  if (full) console.log(`📊 [${key}] ${month} recalculado (${src.origin}, ${src.dataKey}): ${best ? `${fmt(best.value)} ${src.unit} @ ${best.bucket} [${best.source}]` : 'sin ventana sostenida'}${fromRaw ? ` (relleno raw antes del ${REALTIME_COMPLETE_FROM.toISOString().slice(0, 10)}: ${fmt(fromRaw.value)})` : ''}`);
   if (st.value != null) await assertCurrent(src, st);
 }
 

@@ -16,17 +16,23 @@
 const { BigQuery } = require('@google-cloud/bigquery');
 
 const PROJECT_ID = 'iot-admin-panel';
-const TABLE      = '`iot-admin-panel.iot_data.realtime_telemetry`';
+const TABLES = {
+  realtime: '`iot-admin-panel.iot_data.realtime_telemetry`',
+  // Solo para el relleno de días que realtime ya no tiene (ver index.js,
+  // REALTIME_COMPLETE_FROM): 1 muestra cada 5 min, así que el mínimo de la
+  // ventana sale de 3–4 muestras y es una aproximación (nunca menor al real).
+  raw:      '`iot-admin-panel.iot_data.raw_telemetry`',
+};
 const WINDOW_S   = 15 * 60;
 
 const bigquery = new BigQuery({ projectId: PROJECT_ID });
 
-const SQL = `
+const buildSql = (table) => `
   WITH s AS (
     SELECT timestamp AS ts,
            UNIX_MILLIS(timestamp) / 1000 AS sec,
            SAFE_CAST(value AS FLOAT64)   AS v
-    FROM ${TABLE}
+    FROM ${table}
     -- Por topic + data_key (como getRealtimeRange), no por machine_id: si dos
     -- widgets comparten topic y clave, el ingestor guarda solo el machine_id
     -- del primero.
@@ -63,11 +69,11 @@ const SQL = `
  * Los datos se leen hasta `to` ("ahora"), así una ventana que arranca antes de
  * windowTo (fin de mes) puede cerrarse con muestras posteriores. Las ventanas
  * que todavía no cerraron se descartan solas.
- * @returns {Promise<{value:number, bucket:string}|null>}
+ * @returns {Promise<{value:number, bucket:string, source:string}|null>}
  */
-async function sustainedPeak({ tenantId, locationId, topic, dataKey, from, windowTo, to, maxGapS }) {
+async function sustainedPeak({ tenantId, locationId, topic, dataKey, from, windowTo, to, maxGapS, source = 'realtime' }) {
   const [rows] = await bigquery.query({
-    query: SQL,
+    query: buildSql(TABLES[source]),
     location: 'us-central1',
     params: { tenantId, locationId, topic, dataKey, from, windowTo, to, maxGap: maxGapS },
     types: { from: 'TIMESTAMP', windowTo: 'TIMESTAMP', to: 'TIMESTAMP', maxGap: 'FLOAT64' },
@@ -76,7 +82,7 @@ async function sustainedPeak({ tenantId, locationId, topic, dataKey, from, windo
   if (!rows.length) return null;
   // ISO UTC con Z y milisegundos: el formato que Panorama acepta para `bucket`
   // (BigQuery devuelve microsegundos).
-  return { value: rows[0].wmin, bucket: new Date(rows[0].ts.value).toISOString() };
+  return { value: rows[0].wmin, bucket: new Date(rows[0].ts.value).toISOString(), source };
 }
 
 module.exports = { sustainedPeak, WINDOW_S };
